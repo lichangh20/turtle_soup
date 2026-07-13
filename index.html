@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0e0c14" />
+  <title>海龟汤 · 深夜推理谜题</title>
+  <meta name="description" content="一个本地的中文海龟汤（情境推理）游戏：精选流行题库，可向主持人提问，想好了再揭晓汤底。" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐢</text></svg>" />
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body data-theme="dark">
+  <div class="bg" aria-hidden="true">
+    <div class="bg__glow"></div>
+    <div class="bg__grain"></div>
+  </div>
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <button id="brandHome" class="brand"><span class="brand__turtle">🐢</span> 海龟汤</button>
+    <nav class="topnav">
+      <button id="navList" class="topnav__btn is-active">📚 题库</button>
+      <button id="navPlay" class="topnav__btn" hidden>🍜 当前题</button>
+    </nav>
+    <div class="topbar__right">
+      <span id="aiBadge" class="ai-badge" title="出题 / 裁判模式">…</span>
+      <button id="themeToggle" class="icon-btn" title="切换昼夜主题" aria-label="切换主题">🌙</button>
+    </div>
+  </header>
+
+  <main class="stage">
+    <!-- ========== 题库列表视图 ========== -->
+    <section id="viewList" class="view">
+      <div class="hero">
+        <h1 class="hero__title">今晚，想喝哪一碗汤？</h1>
+        <p class="hero__sub">点开题目 → 向主持人提问 → 想清楚了再揭晓汤底。默认只给题面，答案由你决定何时揭开。</p>
+        <div class="hero__controls">
+          <div class="search">
+            <span class="search__icon">🔎</span>
+            <input id="searchInput" type="search" placeholder="搜索标题 / 关键词 / 标签…" autocomplete="off" />
+          </div>
+          <button id="randomBtn" class="btn btn--primary">🎲 随机一题</button>
+          <button id="btnFetch" class="btn btn--web">🌐 从网上获取更多</button>
+          <button id="btnGen" class="btn btn--web" hidden>🤖 AI 出题</button>
+        </div>
+        <nav id="categoryBar" class="chips" aria-label="题目分类"></nav>
+        <p id="listStat" class="list-stat"></p>
+        <details class="howto">
+          <summary>❓ 怎么玩海龟汤？</summary>
+          <div class="howto__body">
+            <p>海龟汤是情境推理游戏：主持人给出一个看似离奇的<b>题面（汤面）</b>，你通过不断提出只能用「是 / 不是」回答的问题，一步步还原背后的真相<b>（汤底）</b>。</p>
+            <ol>
+              <li><b>选题</b> —— 在题库里挑一道，或点「🎲 随机一题」。</li>
+              <li><b>提问</b> —— 在解谜页向主持人发问，得到 是 / 不是 / 无关 / 接近 / 🎉恭喜。</li>
+              <li><b>求助</b> —— 卡住了就「💡 看提示」；配置 AI 后还能请主持人点拨。</li>
+              <li><b>揭晓</b> —— 想清楚了（或想不出了）再点「🥄 公布汤底」核对真相。</li>
+            </ol>
+          </div>
+        </details>
+      </div>
+      <div id="grid" class="grid" aria-live="polite"></div>
+      <p id="emptyHint" class="empty-hint" hidden>没有匹配的题目，换个关键词试试～</p>
+      <p id="sourceNote" class="source-note"></p>
+    </section>
+
+    <!-- ========== 解谜 / 详情视图 ========== -->
+    <section id="viewPlay" class="view" hidden>
+      <button id="backBtn" class="back-btn">← 返回题库</button>
+
+      <article id="card" class="card">
+        <div class="card__steam" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+        <div class="card__top">
+          <span id="categoryBadge" class="badge">恐怖</span>
+          <span id="difficulty" class="pips" title="难度"></span>
+          <span class="card__spacer"></span>
+          <button id="btnFav" class="icon-btn card__fav" title="收藏本题" aria-label="收藏">☆</button>
+        </div>
+        <h2 id="title" class="card__title">题目</h2>
+        <p id="surface" class="card__surface"></p>
+        <div id="tags" class="tags"></div>
+
+        <div id="hintsWrap" class="hints" hidden>
+          <div class="hints__label">💡 提示</div>
+          <ol id="hintsList" class="hints__list"></ol>
+        </div>
+
+        <div id="answerBlock" class="answer">
+          <div class="answer__label">🥄 汤底</div>
+          <p id="answerText" class="answer__text"></p>
+          <button id="answerCover" class="answer__cover" type="button">
+            <span class="answer__cover-main">点击揭晓汤底</span>
+            <span class="answer__cover-sub">先别急，自己先推理出真相了吗？</span>
+          </button>
+        </div>
+      </article>
+
+      <!-- 提问区 -->
+      <section class="qa">
+        <header class="qa__head">
+          <span class="qa__title">🔍 向主持人提问</span>
+          <span class="qa__meta">
+            <span id="qaCount" class="qa__count"></span>
+            <span id="qaMode" class="qa__mode"></span>
+          </span>
+        </header>
+        <div id="chat" class="chat"></div>
+        <form id="askForm" class="ask" autocomplete="off">
+          <input id="askInput" class="ask__input" type="text"
+                 placeholder="问一个能用「是 / 不是」回答的问题…" maxlength="120" />
+          <button id="askBtn" class="btn btn--primary ask__send" type="submit">发送</button>
+        </form>
+      </section>
+
+      <!-- 操作栏 -->
+      <div class="actions">
+        <button id="btnHint" class="btn btn--ghost">💡 看提示</button>
+        <button id="btnAnswer" class="btn btn--primary">🥄 公布汤底</button>
+        <button id="btnNext" class="btn btn--ghost">🔀 换一题</button>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="js/puzzles.js"></script>
+  <script src="js/webmeta.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
