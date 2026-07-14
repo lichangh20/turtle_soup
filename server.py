@@ -5,15 +5,21 @@
 ================================================================
 一个零依赖（仅 Python 标准库）的本地服务器：
   1. 托管前端静态页面（http://localhost:8000）
-  2. /api/fetch  —— 从网上拉取更多中文海龟汤题库（代理，规避跨域）
-  3. /api/ask    —— 由 AI 主持人裁判玩家的提问（是/不是/无关/接近…）
-  4. /api/hint   —— 由 AI 主持人给一条不泄底的提示
-  5. /api/health —— 报告 AI 主持人是否就绪
+  2. /api/fetch    —— 从网上拉取更多中文海龟汤题库（代理，规避跨域）
+  3. /api/ask      —— 由 AI 主持人裁判玩家的提问（是/不是/无关/接近…）
+  4. /api/hint     —— 由 AI 主持人给一条不泄底的提示
+  5. /api/generate —— 由 AI 主持人原创出题
+  6. /api/health   —— 报告当前使用哪个 AI provider
 
-AI 主持人使用 Anthropic 的 Claude 模型（默认 claude-opus-4-8）。
-- 想启用「AI 主持」：先设置环境变量  export ANTHROPIC_API_KEY=sk-ant-...
-- 未设置密钥也能正常游玩：前端会自动切换为「本地裁判（近似）」。
-- 想换更快的模型：export TURTLE_SOUP_MODEL=claude-haiku-4-5
+AI 主持人（裁判）支持多种后端，自动检测、失败可回退：
+  · Gemini（REST）    ：export GEMINI_API_KEY=AIza...        （最快，推荐本地玩）
+  · Anthropic Claude ：export ANTHROPIC_API_KEY=sk-ant-...
+  · Gemini CLI       ：已安装并登录 `gemini` 即可（用它自己的登录态，无需在本程序填 key）
+  · Claude Code CLI  ：已安装并登录 `claude` 即可（用你的 Claude Code 账号，无需任何 API key）
+可选环境变量：
+  · TURTLE_SOUP_PROVIDER = gemini | anthropic | gemini-cli | claude-cli （强制指定后端）
+  · GEMINI_MODEL（默认 gemini-2.5-flash）/ TURTLE_SOUP_MODEL（Claude 模型，默认 claude-opus-4-8）
+所有密钥仅从环境变量读取，绝不写入任何文件、绝不返回给前端。
 
 运行：
     python3 server.py            # 启动并自动打开浏览器
@@ -23,6 +29,8 @@ AI 主持人使用 Anthropic 的 Claude 模型（默认 claude-opus-4-8）。
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,10 +39,13 @@ from urllib import error as urlerror
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# ---- Anthropic Claude 配置 ----
+# ---- 多 provider AI 配置（密钥全部来自环境变量）----
 ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
-MODEL = os.environ.get("TURTLE_SOUP_MODEL", "claude-opus-4-8")
+ANTHROPIC_MODEL = os.environ.get("TURTLE_SOUP_MODEL", "claude-opus-4-8")
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+FORCE_PROVIDER = os.environ.get("TURTLE_SOUP_PROVIDER", "").strip()
 
 # ---- 在线题库地址（与 tools/build_dataset.py 保持一致；raw 最全，CDN 兜底）----
 SOURCE_URLS = [
@@ -118,59 +129,216 @@ GEN_SCHEMA = {
 }
 
 
-def has_api_key():
-    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+def _gemini_key():
+    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
 
-def call_claude(system, user, schema=None, max_tokens=600):
-    """调用 Anthropic Messages API。返回 (data_dict_or_text, error_or_None)。"""
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        return None, "no_api_key"
-    body = {
-        "model": MODEL,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-    }
-    # 结构化输出：opus-4-8 / haiku-4-5 均支持，保证返回合法 JSON。
-    if schema is not None:
-        body["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+PROVIDER_LABEL = {
+    "anthropic": ("Claude", ANTHROPIC_MODEL),
+    "gemini": ("Gemini", GEMINI_MODEL),
+    "gemini-cli": ("Gemini CLI", "gemini"),
+    "claude-cli": ("Claude Code", "claude"),
+    "codex-cli": ("Codex", "codex"),
+}
 
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urlrequest.Request(
-        ANTHROPIC_ENDPOINT,
-        data=data,
-        method="POST",
-        headers={
-            "content-type": "application/json",
-            "x-api-key": key,
-            "anthropic-version": ANTHROPIC_VERSION,
-        },
-    )
+
+def available_providers():
+    """按“速度优先”的顺序返回可用 provider。"""
+    provs = []
+    if _gemini_key():
+        provs.append("gemini")
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        provs.append("anthropic")
+    if shutil.which("gemini"):
+        provs.append("gemini-cli")
+    if shutil.which("claude"):
+        provs.append("claude-cli")
+    if shutil.which("codex"):
+        provs.append("codex-cli")
+    return provs
+
+
+def provider_chain():
+    """实际尝试顺序：强制项优先，其余可用项作为兜底。"""
+    avail = available_providers()
+    if FORCE_PROVIDER and FORCE_PROVIDER in PROVIDER_LABEL:
+        return [FORCE_PROVIDER] + [p for p in avail if p != FORCE_PROVIDER]
+    return avail
+
+
+def ai_status():
+    chain = provider_chain()
+    prov = chain[0] if chain else None
+    label, model = PROVIDER_LABEL.get(prov, ("", "")) if prov else ("", "")
+    avail = [{"id": p, "label": PROVIDER_LABEL.get(p, (p, ""))[0], "model": PROVIDER_LABEL.get(p, (p, ""))[1]}
+             for p in available_providers()]
+    return {"ai": bool(prov), "provider": prov, "label": label, "model": model, "available": avail}
+
+
+# ---------- 通用工具 ----------
+def _gemini_schema(s):
+    """把标准 JSON-Schema 转成 Gemini 的 responseSchema（类型大写、去掉 additionalProperties）。"""
+    if not isinstance(s, dict):
+        return s
+    out = {}
+    for k, v in s.items():
+        if k == "type":
+            out["type"] = str(v).upper()
+        elif k == "properties":
+            out["properties"] = {pk: _gemini_schema(pv) for pk, pv in v.items()}
+        elif k == "items":
+            out["items"] = _gemini_schema(v)
+        elif k == "additionalProperties":
+            continue
+        else:
+            out[k] = v
+    return out
+
+
+def _extract_json(text):
+    """从可能带有 ``` 代码块或多余文字的文本里抠出第一个 JSON 对象。"""
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t[:4].lower() == "json":
+            t = t[4:]
+    i, j = t.find("{"), t.rfind("}")
+    if i >= 0 and j > i:
+        t = t[i:j + 1]
     try:
-        with urlrequest.urlopen(req, timeout=45) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        return json.loads(t)
+    except (ValueError, TypeError):
+        return None
+
+
+def _http_post_json(url, body, headers, timeout=45):
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    req = urlrequest.Request(url, data=data, method="POST", headers=headers)
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8")), None
     except urlerror.HTTPError as e:
-        detail = e.read().decode("utf-8", "ignore")[:300]
-        return None, "http_%d: %s" % (e.code, detail)
+        return None, "http_%d: %s" % (e.code, e.read().decode("utf-8", "ignore")[:180])
     except Exception as e:  # noqa: BLE001
         return None, "error: %s" % e
 
+
+# ---------- 各 provider 生成器：均返回 (dict_or_None, err_or_None) ----------
+def gen_anthropic(system, user, schema, max_tokens):
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        return None, "无 ANTHROPIC_API_KEY"
+    body = {"model": ANTHROPIC_MODEL, "max_tokens": max_tokens, "system": system,
+            "messages": [{"role": "user", "content": user}],
+            "output_config": {"format": {"type": "json_schema", "schema": schema}}}
+    payload, err = _http_post_json(ANTHROPIC_ENDPOINT, body, {
+        "content-type": "application/json", "x-api-key": key, "anthropic-version": ANTHROPIC_VERSION})
+    if err:
+        return None, err
     if payload.get("stop_reason") == "refusal":
         return None, "refusal"
-
     text = ""
     for block in payload.get("content", []):
         if block.get("type") == "text":
             text = block.get("text", "")
             break
-    if schema is not None:
-        try:
-            return json.loads(text), None
-        except (ValueError, TypeError):
-            return None, "parse_error: %s" % text[:200]
-    return text, None
+    obj = _extract_json(text)
+    return (obj, None) if obj is not None else (None, "解析失败")
+
+
+def gen_gemini(system, user, schema, max_tokens):
+    key = _gemini_key()
+    if not key:
+        return None, "无 GEMINI_API_KEY"
+    url = GEMINI_ENDPOINT % (GEMINI_MODEL, key)
+    body = {"systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"parts": [{"text": user}]}],
+            "generationConfig": {"responseMimeType": "application/json",
+                                 "responseSchema": _gemini_schema(schema),
+                                 "maxOutputTokens": max_tokens}}
+    payload, err = _http_post_json(url, body, {"content-type": "application/json"})
+    if err:
+        return None, err
+    try:
+        text = payload["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        return None, "gemini 无有效返回"
+    obj = _extract_json(text)
+    return (obj, None) if obj is not None else (None, "解析失败")
+
+
+def _run_cli(cmd, timeout=150):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        return None, "CLI 调用失败: %s" % e
+    if p.returncode != 0:
+        return None, "CLI 退出码 %d: %s" % (p.returncode, (p.stderr or "")[:150])
+    return p.stdout, None
+
+
+def gen_gemini_cli(system, user, schema, max_tokens):
+    prompt = system + "\n\n" + user + "\n\n只输出一个 JSON 对象（不要代码块、不要任何解释）。"
+    out, err = _run_cli(["gemini", "-p", prompt, "-o", "json", "--approval-mode", "plan"])
+    if err:
+        return None, err
+    text = out
+    try:
+        text = json.loads(out).get("response", out)
+    except (ValueError, TypeError):
+        pass
+    obj = _extract_json(text)
+    return (obj, None) if obj is not None else (None, "gemini-cli 解析失败")
+
+
+def gen_claude_cli(system, user, schema, max_tokens):
+    prompt = system + "\n\n" + user + "\n\n只输出一个 JSON 对象（不要代码块、不要任何解释）。"
+    out, err = _run_cli(["claude", "-p", prompt, "--output-format", "json"])
+    if err:
+        return None, err
+    text = out
+    try:
+        text = json.loads(out).get("result", out)
+    except (ValueError, TypeError):
+        pass
+    obj = _extract_json(text)
+    return (obj, None) if obj is not None else (None, "claude-cli 解析失败")
+
+
+def gen_codex_cli(system, user, schema, max_tokens):
+    # 尽力而为：codex exec 非交互模式；输出里抠出 JSON。
+    prompt = system + "\n\n" + user + "\n\n只输出一个 JSON 对象（不要代码块、不要任何解释）。"
+    out, err = _run_cli(["codex", "exec", "--skip-git-repo-check", prompt])
+    if err:
+        return None, err
+    obj = _extract_json(out)
+    return (obj, None) if obj is not None else (None, "codex-cli 解析失败")
+
+
+_GENERATORS = {"anthropic": gen_anthropic, "gemini": gen_gemini, "gemini-cli": gen_gemini_cli,
+               "claude-cli": gen_claude_cli, "codex-cli": gen_codex_cli}
+
+
+def ai_generate(system, user, schema, max_tokens=600, preferred=None):
+    """按 provider_chain 依次尝试，第一个成功即返回。preferred 会被排到最前。
+    返回 (dict, provider, err)。"""
+    chain = provider_chain()
+    if preferred and preferred in _GENERATORS and preferred in available_providers():
+        chain = [preferred] + [p for p in chain if p != preferred]
+    if not chain:
+        return None, None, "no_provider"
+    last_err = None
+    for prov in chain:
+        gen = _GENERATORS.get(prov)
+        if not gen:
+            continue
+        obj, err = gen(system, user, schema, max_tokens)
+        if obj is not None:
+            return obj, prov, None
+        last_err = "%s(%s)" % (prov, err)
+    return None, None, last_err or "all_failed"
 
 
 def build_ask_user(surface, answer, question, history):
@@ -242,7 +410,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/api/health":
-            return self._send_json({"ok": True, "ai": has_api_key(), "model": MODEL})
+            st = ai_status()
+            return self._send_json({"ok": True, "ai": st["ai"], "provider": st["provider"],
+                                    "label": st["label"], "model": st["model"],
+                                    "available": st["available"]})
         if path == "/api/fetch":
             text, source = fetch_online_bank()
             if text:
@@ -270,15 +441,16 @@ class Handler(BaseHTTPRequestHandler):
         if not surface or not answer or not question:
             return self._send_json({"ok": False, "reason": "bad_request"}, status=400)
         user = build_ask_user(surface, answer, question, history)
-        result, err = call_claude(ASK_SYSTEM, user, schema=ASK_SCHEMA, max_tokens=500)
-        if err:
-            return self._send_json({"ok": False, "reason": err})
+        result, prov, err = ai_generate(ASK_SYSTEM, user, ASK_SCHEMA, max_tokens=500,
+                                        preferred=(body.get("provider") or "").strip() or None)
+        if err or result is None:
+            return self._send_json({"ok": False, "reason": err or "ai_failed"})
         return self._send_json({
             "ok": True,
             "verdict": result.get("verdict", "无关"),
             "note": result.get("note", ""),
             "solved": bool(result.get("solved", False)),
-            "model": MODEL,
+            "provider": prov,
         })
 
     def _handle_hint(self):
@@ -291,10 +463,11 @@ class Handler(BaseHTTPRequestHandler):
         user = "【汤面】\n%s\n\n【汤底（仅你可见）】\n%s" % (surface, answer)
         if asked:
             user += "\n\n【已经给过的提示，请不要重复】\n" + "\n".join("- " + a for a in asked[-5:])
-        result, err = call_claude(HINT_SYSTEM, user, schema=HINT_SCHEMA, max_tokens=300)
-        if err:
-            return self._send_json({"ok": False, "reason": err})
-        return self._send_json({"ok": True, "hint": result.get("hint", ""), "model": MODEL})
+        result, prov, err = ai_generate(HINT_SYSTEM, user, HINT_SCHEMA, max_tokens=300,
+                                        preferred=(body.get("provider") or "").strip() or None)
+        if err or result is None:
+            return self._send_json({"ok": False, "reason": err or "ai_failed"})
+        return self._send_json({"ok": True, "hint": result.get("hint", ""), "provider": prov})
 
     def _handle_generate(self):
         body = self._read_body()
@@ -302,10 +475,11 @@ class Handler(BaseHTTPRequestHandler):
         user = "请原创一道全新的海龟汤。"
         if flavor:
             user += "口味偏向：%s。" % flavor
-        result, err = call_claude(GEN_SYSTEM, user, schema=GEN_SCHEMA, max_tokens=1200)
-        if err:
-            return self._send_json({"ok": False, "reason": err})
-        return self._send_json({"ok": True, "puzzle": result, "model": MODEL})
+        result, prov, err = ai_generate(GEN_SYSTEM, user, GEN_SCHEMA, max_tokens=1200,
+                                        preferred=(body.get("provider") or "").strip() or None)
+        if err or result is None:
+            return self._send_json({"ok": False, "reason": err or "ai_failed"})
+        return self._send_json({"ok": True, "puzzle": result, "provider": prov})
 
     # ---------- 静态文件 ----------
     def _serve_static(self, path):
@@ -343,7 +517,11 @@ def main():
     args = parser.parse_args()
 
     url = "http://%s:%d/" % ("localhost" if args.host in ("127.0.0.1", "0.0.0.0") else args.host, args.port)
-    ai = "✅ 已就位（%s）" % MODEL if has_api_key() else "⚠️ 未配置 ANTHROPIC_API_KEY —— 将使用「本地裁判(近似)」"
+    st = ai_status()
+    if st["ai"]:
+        ai = "✅ %s（%s） · 可选后端: %s" % (st["label"], st["model"], ", ".join(a["label"] for a in st["available"]))
+    else:
+        ai = "⚠️ 未检测到 AI —— 请 export GEMINI_API_KEY 或 ANTHROPIC_API_KEY，或安装并登录 gemini / claude CLI"
 
     print("\n  🐢  海龟汤 已启动")
     print("  ────────────────────────────────────────")

@@ -1,8 +1,9 @@
 /* =========================================================================
    海龟汤 · 交互逻辑（原生 JS，无依赖）
-   两个视图：题库(list) + 解谜(play)。解谜内可向「主持人」提问。
-   - 通过本地服务器打开时：若配置了 ANTHROPIC_API_KEY，则由 Claude 实时裁判；
-   - 否则（含 file:// 直接打开）：使用「本地裁判(近似)」，保证离线也能玩。
+   两个视图：题库(list) + 解谜(play)。解谜内向「AI 主持人」提问，由 Claude 大模型裁判。
+   启用 AI 的两种方式（二选一）：
+   - 运行 server.py 且设置了环境变量 ANTHROPIC_API_KEY（密钥留在服务器端，最安全）；
+   - 或在页面右上角 🔑 填入 Anthropic API Key（浏览器直连，密钥仅存本机；可用于 file:// 与 GitHub Pages）。
    ========================================================================= */
 (function () {
   "use strict";
@@ -29,21 +30,52 @@
     "不好说":   { cls: "v-none", label: "不好说" },
   };
 
+  /* ---------- AI 主持人（Claude）提示词与结构化输出 ---------- */
+  const AI_MODEL_DEFAULT = "claude-opus-4-8";
+  const ASK_SYSTEM = `你是「海龟汤」情境推理游戏的主持人。你已知这道题的【汤面】（玩家能看到的谜面）和【汤底】（真相，玩家看不到）。
+玩家会向你提出只能用「是/否」回答的问题，你要严格依据【汤底】判断，并从下列选项中给出唯一判定：
+- "是"：按汤底，问题描述的情况成立。
+- "不是"：按汤底，不成立。
+- "是也不是"：部分成立、或需分情况。
+- "无关"：与还原真相无关，或汤底中没有相关信息。
+- "接近"：方向正确、已接近真相但还不完整。
+- "恭喜"：玩家说对了汤底的关键真相（核心因果说对了）。
+原则：只依据汤底判断，绝不编造；判断要果断稳定，同样的问题给一致判定；note 用一句话简短引导，除"恭喜"外绝不能剧透汤底关键信息；solved 仅在"恭喜"时为 true。只输出结构化 JSON。`;
+  const ASK_SCHEMA = { type: "object", properties: {
+      verdict: { type: "string", enum: ["是", "不是", "是也不是", "无关", "接近", "恭喜"] },
+      note: { type: "string" }, solved: { type: "boolean" },
+    }, required: ["verdict", "note", "solved"], additionalProperties: false };
+  const HINT_SYSTEM = `你是「海龟汤」游戏的主持人。根据【汤面】和【汤底】，给玩家一条循序渐进、绝不直接泄底的提示，帮助他们向真相靠近一步。只给一条，简短（一两句），语气俏皮一点，不要说出汤底关键答案。只输出结构化 JSON。`;
+  const HINT_SCHEMA = { type: "object", properties: { hint: { type: "string" } }, required: ["hint"], additionalProperties: false };
+  const GEN_SYSTEM = `你是一位擅长创作「海龟汤」（情境推理谜题）的出题人。请原创一道有趣、逻辑自洽、能通过「是/否」提问一步步推理出来的海龟汤。
+要求：surface(汤面) 简洁悬疑 30~80 字、只写表象不含解释；answer(汤底) 完整揭示真相与因果 60~200 字、答案唯一；hints 给 2~3 条循序渐进不泄底的提示；difficulty 为 1~5 整数；tags 给 2~4 个中文标签；category 从 qing/tuili/kongbu/wenqing/naodong 里选最贴切的一个；若给定 flavor 口味请贴合它。有创意有反转即可，不必过度血腥。只输出结构化 JSON。`;
+  const GEN_SCHEMA = { type: "object", properties: {
+      title: { type: "string" }, surface: { type: "string" }, answer: { type: "string" },
+      hints: { type: "array", items: { type: "string" } }, difficulty: { type: "integer" },
+      tags: { type: "array", items: { type: "string" } },
+      category: { type: "string", enum: ["qing", "tuili", "kongbu", "wenqing", "naodong"] },
+    }, required: ["title", "surface", "answer", "hints", "difficulty", "tags", "category"], additionalProperties: false };
+
   const $ = (id) => document.getElementById(id);
   const el = {};
   ["brandHome","navList","navPlay","aiBadge","themeToggle","viewList","viewPlay",
    "searchInput","randomBtn","btnFetch","categoryBar","listStat","grid","emptyHint","sourceNote",
    "backBtn","card","categoryBadge","difficulty","btnFav","title","surface","tags",
    "hintsWrap","hintsList","answerBlock","answerText","answerCover","qaMode","chat","askForm",
-   "askInput","askBtn","btnHint","btnAnswer","btnNext","toast","btnGen","qaCount"].forEach((k) => (el[k] = $(k)));
+   "askInput","askBtn","btnHint","btnAnswer","btnNext","toast","btnGen","qaCount",
+   "keyModal","keyInput","modelInput","keySave","keyClear","keyClose","keyStatus",
+   "providerRow","providerSelect"].forEach((k) => (el[k] = $(k)));
 
   /* ---------- 状态 ---------- */
   const K_FAV = "ts_favorites", K_THEME = "ts_theme", K_SEEN = "ts_seen", K_SOLVED = "ts_solved";
+  const K_APIKEY = "ts_api_key", K_MODEL = "ts_api_model", K_PROVIDER = "ts_provider";
   let deck = [], byId = new Map();
   let favorites = new Set(), seen = new Set(), solved = new Set();
   let currentCat = "all", search = "";
   let current = null, hintIndex = 0, answerShown = false, asking = false;
-  let aiAvailable = false, aiSeq = 1;
+  let serverAI = false, browserKey = "", aiModel = "", aiSeq = 1;
+  let serverLabel = "", serverModel = "", chosenProvider = "", serverProviders = [];
+  const aiReady = () => serverAI || !!browserKey;
   const chats = {};      // id -> [ {who:'host'|'me', ...} ]
   const aiHints = {};    // id -> [hint strings already given]
 
@@ -229,7 +261,7 @@
   function updateHintBtn() {
     const p = current; const n = p && p.hints ? p.hints.length : 0;
     if (hintIndex < n) { el.btnHint.disabled = false; el.btnHint.textContent = "💡 看提示 (" + hintIndex + "/" + n + ")"; }
-    else if (aiAvailable) { el.btnHint.disabled = false; el.btnHint.textContent = "✦ 求主持人点拨"; }
+    else if (aiReady()) { el.btnHint.disabled = false; el.btnHint.textContent = "✦ 求主持人点拨"; }
     else { el.btnHint.disabled = true; el.btnHint.textContent = n ? "💡 提示已看完" : "💡 暂无提示"; }
   }
   function appendHint(text, isAi) {
@@ -241,15 +273,13 @@
     const p = current; if (!p) return;
     const hints = p.hints || [];
     if (hintIndex < hints.length) { appendHint(hints[hintIndex], false); hintIndex++; updateHintBtn(); return; }
-    if (!aiAvailable) { toast("已经没有更多提示啦，试着揭晓汤底或换一题～"); return; }
+    if (!aiReady()) { toast("点右上角 🔑 设置 API Key 后，可请主持人给提示"); openKeyPanel(); return; }
     el.btnHint.classList.add("is-loading"); el.btnHint.disabled = true;
     try {
-      const res = await fetch("api/hint", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ surface: p.surface, answer: p.answer, asked: aiHints[p.id] || [] }) });
-      const data = await res.json();
-      if (data.ok && data.hint) { aiHints[p.id] = (aiHints[p.id] || []).concat(data.hint); appendHint(data.hint, true); }
+      const hint = await judgeHint(p.surface, p.answer, aiHints[p.id] || []);
+      if (hint) { aiHints[p.id] = (aiHints[p.id] || []).concat(hint); appendHint(hint, true); }
       else toast("主持人一时也想不出新提示了");
-    } catch (e) { toast("获取提示失败，请稍后再试"); }
+    } catch (e) { toast(aiErrText(e)); }
     finally { el.btnHint.classList.remove("is-loading"); updateHintBtn(); }
   }
 
@@ -264,9 +294,16 @@
 
   /* ---------- 提问区（聊天） ---------- */
   function updateQaMode() {
-    el.qaMode.textContent = aiAvailable ? "🤖 AI 主持人实时裁判" : "🧩 本地裁判 · 近似判断，仅供参考";
-    el.aiBadge.className = "ai-badge " + (aiAvailable ? "is-ai" : "is-local");
-    el.aiBadge.textContent = aiAvailable ? "🤖 AI 主持" : "🧩 本地裁判";
+    const on = aiReady();
+    let desc;
+    if (serverAI) desc = "服务器 · " + activeProviderLabel();
+    else if (browserKey) desc = "浏览器·Claude · " + (aiModel || AI_MODEL_DEFAULT);
+    else desc = "";
+    el.qaMode.textContent = on ? ("🤖 AI 主持（" + desc + "）") : "⚠️ 未启用 AI · 点 🔑 设置 API Key";
+    el.aiBadge.className = "ai-badge " + (on ? "is-ai" : "is-off");
+    el.aiBadge.textContent = on ? "🤖 AI 主持" : "🔑 设置 Key";
+    el.aiBadge.title = on ? "AI 主持人已就位（点击可修改 Key）" : "点击设置 Anthropic API Key 以启用 AI 主持人";
+    if (el.btnGen) el.btnGen.hidden = !on;
   }
   function updateQaCount() {
     const p = current; if (!p) { el.qaCount.textContent = ""; return; }
@@ -292,6 +329,9 @@
     } else if (m.greet) {
       wrap.className = "msg msg--host";
       const b = document.createElement("div"); b.className = "msg__bubble"; b.textContent = m.text; wrap.appendChild(b);
+    } else if (m.error) {
+      wrap.className = "msg msg--host error";
+      const b = document.createElement("div"); b.className = "msg__bubble"; b.textContent = "⚠️ " + m.text; wrap.appendChild(b);
     } else {
       wrap.className = "msg msg--host";
       const b = document.createElement("div"); b.className = "msg__bubble";
@@ -310,63 +350,113 @@
   async function ask(question) {
     const p = current; if (!p || asking) return;
     const q = question.trim(); if (!q) return;
+    if (!aiReady()) { toast("请先点右上角 🔑 设置 Anthropic API Key（或用配置了密钥的服务器打开）"); openKeyPanel(); return; }
     asking = true; el.askBtn.disabled = true; el.askInput.disabled = true;
     chats[p.id].push({ who: "me", text: q });
     chats[p.id].push({ who: "host", thinking: true });
     renderChat();
+    try {
+      const hist = [];
+      const msgs = chats[p.id];
+      for (let i = 0; i < msgs.length; i++) { if (msgs[i].who === "me") { const next = msgs[i + 1]; if (next && next.verdict) hist.push({ q: msgs[i].text, verdict: next.verdict }); } }
+      const r = await judgeAsk(p.surface, p.answer, q, hist);
+      chats[p.id] = chats[p.id].filter((m) => !m.thinking);
+      const qn = chats[p.id].filter((m) => m.who === "me").length;
+      chats[p.id].push({ who: "host", verdict: r.verdict, note: r.note, qn: qn });
+      renderChat();
+      if (r.solved || r.verdict === "恭喜") {
+        if (!solved.has(p.id)) { solved.add(p.id); saveSet(K_SOLVED, solved); }
+        toast("🎉 猜对啦！可以点「公布汤底」核对完整真相。");
+      }
+    } catch (e) {
+      chats[p.id] = chats[p.id].filter((m) => !m.thinking);
+      chats[p.id].push({ who: "host", error: true, text: aiErrText(e) });
+      renderChat();
+    } finally {
+      asking = false; el.askBtn.disabled = false; el.askInput.disabled = false; el.askInput.focus();
+    }
+  }
 
-    let verdict, note, solvedFlag = false;
-    if (aiAvailable) {
+  /* ---------- AI 客户端（服务器优先，其次浏览器直连 Anthropic）----------
+     无 AI 时不再有“本地裁判”兜底：海龟汤的裁判必须由大模型完成。 */
+  async function anthropicDirect(system, user, schema, maxTokens) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": browserKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: aiModel || AI_MODEL_DEFAULT, max_tokens: maxTokens,
+        system: system, messages: [{ role: "user", content: user }],
+        output_config: { format: { type: "json_schema", schema: schema } },
+      }),
+    });
+    if (!res.ok) {
+      let t = ""; try { t = await res.text(); } catch (e) {}
+      throw new Error("HTTP " + res.status + (res.status === 401 ? "（API Key 无效）" : "") + " " + t.slice(0, 120));
+    }
+    const data = await res.json();
+    if (data.stop_reason === "refusal") throw new Error("模型拒绝作答");
+    let text = ""; for (const b of (data.content || [])) { if (b.type === "text") { text = b.text; break; } }
+    return JSON.parse(text);
+  }
+  function buildAskUser(surface, answer, question, history) {
+    let u = "【汤面】\n" + surface.trim() + "\n\n【汤底（仅你可见，严禁泄露给玩家）】\n" + answer.trim();
+    if (history && history.length) {
+      const lines = history.slice(-8).filter((h) => h.q).map((h) => "玩家问：" + h.q + " → 你答：" + h.verdict);
+      if (lines.length) u += "\n\n【已问过的问题（保持判定一致）】\n" + lines.join("\n");
+    }
+    return u + "\n\n【玩家现在的提问】\n" + question.trim();
+  }
+  function serverReason(r) { return r === "no_api_key" ? "服务器未配置密钥" : ("服务器出错：" + (r || "")); }
+  async function judgeAsk(surface, answer, question, history) {
+    if (serverAI) {
       try {
-        const hist = [];
-        const msgs = chats[p.id];
-        for (let i = 0; i < msgs.length; i++) { if (msgs[i].who === "me") { const next = msgs[i + 1]; if (next && next.verdict) hist.push({ q: msgs[i].text, verdict: next.verdict }); } }
         const res = await fetch("api/ask", { method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ surface: p.surface, answer: p.answer, question: q, history: hist.slice(0, -1) }) });
-        const data = await res.json();
-        if (data.ok) { verdict = data.verdict; note = data.note; solvedFlag = data.solved; }
-        else { const j = localJudge(q, p); verdict = j.verdict; note = "（本地裁判）" + j.note; }
-      } catch (e) { const j = localJudge(q, p); verdict = j.verdict; note = "（本地裁判）" + j.note; }
-    } else {
-      const j = localJudge(q, p); verdict = j.verdict; note = j.note;
-      solvedFlag = verdict === "恭喜";
+          body: JSON.stringify({ surface: surface, answer: answer, question: question, history: history, provider: chosenProvider }) });
+        const d = await res.json();
+        if (d.ok) return { verdict: d.verdict, note: d.note, solved: d.solved };
+        if (!browserKey) throw new Error(serverReason(d.reason));
+      } catch (e) { if (!browserKey) throw e; }
     }
-
-    chats[p.id] = chats[p.id].filter((m) => !m.thinking);
-    const qn = chats[p.id].filter((m) => m.who === "me").length;
-    chats[p.id].push({ who: "host", verdict: verdict, note: note, qn: qn });
-    renderChat();
-
-    if (solvedFlag || verdict === "恭喜") {
-      if (!solved.has(p.id)) { solved.add(p.id); saveSet(K_SOLVED, solved); }
-      toast("🎉 猜对啦！可以点「公布汤底」核对完整真相。");
-    }
-    asking = false; el.askBtn.disabled = false; el.askInput.disabled = false; el.askInput.focus();
+    const r = await anthropicDirect(ASK_SYSTEM, buildAskUser(surface, answer, question, history), ASK_SCHEMA, 500);
+    return { verdict: r.verdict, note: r.note, solved: !!r.solved };
   }
-
-  /* ---------- 本地裁判（近似，离线可用） ---------- */
-  function bigrams(s) {
-    const t = String(s).replace(/[\s，。、！？；：""''（）()\[\]{}.,!?;:"'~—…-]/g, "");
-    const set = new Set();
-    for (let i = 0; i < t.length - 1; i++) set.add(t.slice(i, i + 2));
-    if (t.length === 1) set.add(t);
-    return set;
-  }
-  function overlap(a, b) { let n = 0; a.forEach((x) => { if (b.has(x)) n++; }); return a.size ? n / a.size : 0; }
-  function localJudge(q, p) {
-    if (!q) return { verdict: "无关", note: "请先输入一个能用「是 / 不是」回答的问题～" };
-    const qg = bigrams(q), ag = bigrams(p.answer), sg = bigrams(p.surface);
-    const ao = overlap(qg, ag), so = overlap(qg, sg);
-    const neg = /(不|没|无|非|别|未)/.test(q);
-    const isGuess = /(是不是因为|是因为|因为|所以|真相是|答案是|我猜|其实|难道|莫非|凶手|自杀|他杀)/.test(q) || q.length >= 16;
-    if (ao >= 0.5) {
-      if (isGuess) return { verdict: "恭喜", note: "你已经非常接近真相了！点「公布汤底」核对一下吧。" };
-      return neg ? { verdict: "不是", note: "" } : { verdict: "是", note: "" };
+  async function judgeHint(surface, answer, asked) {
+    if (serverAI) {
+      try {
+        const res = await fetch("api/hint", { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ surface: surface, answer: answer, asked: asked, provider: chosenProvider }) });
+        const d = await res.json();
+        if (d.ok) return d.hint;
+        if (!browserKey) throw new Error(serverReason(d.reason));
+      } catch (e) { if (!browserKey) throw e; }
     }
-    if (ao >= 0.28) return { verdict: "接近", note: "方向对了，再具体一点。" };
-    if (so >= 0.4 && ao < 0.15) return { verdict: "无关", note: "这和汤面已知信息相关，但不是关键。" };
-    if (ao <= 0.08) return { verdict: "无关", note: "" };
-    return { verdict: "不好说", note: "本地裁判也拿不准，换个角度问问看？" };
+    let u = "【汤面】\n" + surface + "\n\n【汤底（仅你可见）】\n" + answer;
+    if (asked && asked.length) u += "\n\n【已给过的提示，请勿重复】\n" + asked.map((a) => "- " + a).join("\n");
+    return (await anthropicDirect(HINT_SYSTEM, u, HINT_SCHEMA, 300)).hint;
+  }
+  async function judgeGenerate(flavor) {
+    if (serverAI) {
+      try {
+        const res = await fetch("api/generate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ flavor: flavor, provider: chosenProvider }) });
+        const d = await res.json();
+        if (d.ok && d.puzzle) return d.puzzle;
+        if (!browserKey) throw new Error(serverReason(d.reason));
+      } catch (e) { if (!browserKey) throw e; }
+    }
+    let u = "请原创一道全新的海龟汤。"; if (flavor) u += "口味偏向：" + flavor + "。";
+    return await anthropicDirect(GEN_SYSTEM, u, GEN_SCHEMA, 1200);
+  }
+  function aiErrText(e) {
+    const m = (e && e.message) || String(e);
+    if (m.indexOf("401") >= 0 || m.indexOf("Key 无效") >= 0) return "API Key 无效或无权限，请点右上角 🔑 检查后重试。";
+    if (m.indexOf("Failed to fetch") >= 0 || m.indexOf("NetworkError") >= 0 || m.indexOf("Load failed") >= 0) return "连接 AI 失败（网络或跨域被拦截）。请检查网络，或改用 python3 server.py 打开。";
+    if (m.indexOf("未配置密钥") >= 0) return "服务器没有配置 ANTHROPIC_API_KEY —— 可点右上角 🔑 直接填入 Key。";
+    return "AI 主持人暂时无法回应：" + m;
   }
 
   /* ---------- 换一题 ---------- */
@@ -442,28 +532,86 @@
     };
   }
   async function generatePuzzle() {
-    if (!aiAvailable) { toast("AI 出题需先配置 ANTHROPIC_API_KEY 并通过本地服务器打开"); return; }
+    if (!aiReady()) { toast("AI 出题需先点右上角 🔑 设置 API Key（或用配置了密钥的服务器打开）"); openKeyPanel(); return; }
     el.btnGen.classList.add("is-loading"); el.btnGen.disabled = true;
     try {
       const flavor = (currentCat !== "all" && currentCat !== "fav" && CAT_MAP[currentCat]) ? CAT_MAP[currentCat].label : "";
-      const res = await fetch("api/generate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ flavor }) });
-      const data = await res.json();
-      if (data.ok && data.puzzle && data.puzzle.surface && data.puzzle.answer) {
-        const p = normGenerated(data.puzzle);
+      const g = await judgeGenerate(flavor);
+      if (g && g.surface && g.answer) {
+        const p = normGenerated(g);
         deck.push(p); byId.set(p.id, p); buildChips();
         toast("🤖 AI 现编了一道新题，开始推理吧！");
         openPuzzle(p.id);
       } else toast("AI 出题失败了，稍后再试～");
-    } catch (e) { toast("AI 出题失败，请检查网络"); }
+    } catch (e) { toast(aiErrText(e)); }
     finally { el.btnGen.classList.remove("is-loading"); el.btnGen.disabled = false; }
+  }
+
+  /* ---------- AI 设置面板（选择后端 / 填 Key） ---------- */
+  function activeProviderLabel() {
+    if (chosenProvider) {
+      const p = serverProviders.find((x) => x.id === chosenProvider);
+      if (p) return p.label + (p.model ? " · " + p.model : "");
+    }
+    return (serverLabel || "AI") + (serverModel ? " · " + serverModel : "");
+  }
+  function populateProviders() {
+    if (!el.providerSelect) return;
+    el.providerSelect.innerHTML = "";
+    const auto = document.createElement("option"); auto.value = ""; auto.textContent = "自动（推荐，最快优先 + 自动回退）";
+    el.providerSelect.appendChild(auto);
+    serverProviders.forEach((p) => {
+      const o = document.createElement("option"); o.value = p.id;
+      o.textContent = p.label + (p.model ? "（" + p.model + "）" : "");
+      el.providerSelect.appendChild(o);
+    });
+    el.providerSelect.value = chosenProvider || "";
+    if (el.providerRow) el.providerRow.hidden = serverProviders.length === 0;
+  }
+  function refreshKeyStatus() {
+    if (!el.keyStatus) return;
+    if (serverAI) el.keyStatus.textContent = "当前：本地服务器 · " + activeProviderLabel();
+    else if (browserKey) el.keyStatus.textContent = "当前：浏览器直连 Claude（" + (aiModel || AI_MODEL_DEFAULT) + "）";
+    else el.keyStatus.textContent = "当前：未启用 AI —— 提问 / AI 出题都需要它。";
+  }
+  function openKeyPanel() {
+    populateProviders();
+    if (el.keyInput) el.keyInput.value = browserKey || "";
+    if (el.modelInput) el.modelInput.value = aiModel || "";
+    refreshKeyStatus();
+    if (el.keyModal) el.keyModal.hidden = false;
+  }
+  function closeKeyPanel() { if (el.keyModal) el.keyModal.hidden = true; }
+  function saveKey() {
+    const k = (el.keyInput.value || "").trim();
+    const m = (el.modelInput.value || "").trim();
+    if (el.providerSelect) chosenProvider = el.providerSelect.value;
+    browserKey = k; aiModel = m;
+    try {
+      if (k) localStorage.setItem(K_APIKEY, k); else localStorage.removeItem(K_APIKEY);
+      if (m) localStorage.setItem(K_MODEL, m); else localStorage.removeItem(K_MODEL);
+      if (chosenProvider) localStorage.setItem(K_PROVIDER, chosenProvider); else localStorage.removeItem(K_PROVIDER);
+    } catch (e) {}
+    updateQaMode(); closeKeyPanel();
+    toast(aiReady() ? "✅ 已更新 AI 主持人设置" : "已保存（当前仍未启用 AI）");
+  }
+  function clearKey() {
+    browserKey = ""; aiModel = "";
+    try { localStorage.removeItem(K_APIKEY); localStorage.removeItem(K_MODEL); } catch (e) {}
+    if (el.keyInput) el.keyInput.value = "";
+    if (el.modelInput) el.modelInput.value = "";
+    updateQaMode(); refreshKeyStatus();
+    toast("已清除浏览器里的 API Key");
   }
 
   /* ---------- AI 探测 ---------- */
   async function detectAI() {
-    try { const res = await fetch("api/health", { cache: "no-store" }); if (res.ok) { const d = await res.json(); aiAvailable = !!(d && d.ai); } }
-    catch (e) { aiAvailable = false; }
+    try {
+      const res = await fetch("api/health", { cache: "no-store" });
+      if (res.ok) { const d = await res.json(); serverAI = !!(d && d.ai); serverLabel = (d && d.label) || ""; serverModel = (d && d.model) || ""; serverProviders = (d && d.available) || []; }
+    } catch (e) { serverAI = false; }
+    populateProviders();
     updateQaMode();
-    el.btnGen.hidden = !aiAvailable;
   }
 
   /* ---------- 初始化 ---------- */
@@ -473,6 +621,7 @@
     byId = new Map(deck.map((p) => [p.id, p]));
     favorites = new Set([...loadSet(K_FAV)].filter((id) => byId.has(id)));
     seen = loadSet(K_SEEN); solved = loadSet(K_SOLVED);
+    try { browserKey = localStorage.getItem(K_APIKEY) || ""; aiModel = localStorage.getItem(K_MODEL) || ""; chosenProvider = localStorage.getItem(K_PROVIDER) || ""; } catch (e) {}
 
     buildChips();
     el.sourceNote.innerHTML = "题库来源：网络公开题库 + 世界经典情境谜题 · 离线自带 <b>" + deck.length + "</b> 题，点「🌐 从网上获取更多」可解锁更多在线题目。";
@@ -489,13 +638,29 @@
     el.searchInput.addEventListener("input", () => { search = el.searchInput.value.trim(); renderGrid(); });
     el.themeToggle.addEventListener("click", () => applyTheme(document.body.getAttribute("data-theme") === "dark" ? "light" : "dark"));
 
+    // AI 设置面板
+    el.aiBadge.addEventListener("click", openKeyPanel);
+    if (el.keyClose) el.keyClose.addEventListener("click", closeKeyPanel);
+    if (el.keyModal) el.keyModal.addEventListener("click", (e) => { if (e.target === el.keyModal) closeKeyPanel(); });
+    if (el.keySave) el.keySave.addEventListener("click", saveKey);
+    if (el.keyClear) el.keyClear.addEventListener("click", clearKey);
+    if (el.providerSelect) el.providerSelect.addEventListener("change", () => {
+      chosenProvider = el.providerSelect.value;
+      try { if (chosenProvider) localStorage.setItem(K_PROVIDER, chosenProvider); else localStorage.removeItem(K_PROVIDER); } catch (e) {}
+      updateQaMode(); refreshKeyStatus();
+    });
+
     el.btnFav.addEventListener("click", () => current && toggleFav(current.id));
     el.btnHint.addEventListener("click", onHint);
     el.btnAnswer.addEventListener("click", toggleAnswer);
     el.answerCover.addEventListener("click", () => { if (!answerShown) toggleAnswer(); });
     el.btnNext.addEventListener("click", nextPuzzle);
     el.askForm.addEventListener("submit", (e) => { e.preventDefault(); const q = el.askInput.value; el.askInput.value = ""; ask(q); });
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !el.viewPlay.hidden) showList(); });
+    document.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      if (el.keyModal && !el.keyModal.hidden) { closeKeyPanel(); return; }
+      if (!el.viewPlay.hidden) showList();
+    });
 
     renderGrid();
     detectAI();

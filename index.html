@@ -120,6 +120,34 @@
     </section>
   </main>
 
+  <!-- AI 主持人设置 -->
+  <div id="keyModal" class="modal" hidden>
+    <div class="modal__card">
+      <button id="keyClose" class="modal__x" aria-label="关闭">✕</button>
+      <h3 class="modal__title">🤖 AI 主持人设置</h3>
+      <p class="modal__desc">海龟汤的提问裁判由大模型完成。选一个后端即可开始。</p>
+
+      <div id="providerRow" class="modal__row" hidden>
+        <label>① 选择 AI 后端（本地服务器已检测到）</label>
+        <select id="providerSelect" class="modal__select"></select>
+        <p class="modal__note">通过 <code>python3 server.py</code> 打开时可选：Gemini / Claude Code / Codex 等，取决于你本机装了哪些。「自动」会优先用最快的并自动回退。</p>
+      </div>
+
+      <div class="modal__row">
+        <label>② 或：浏览器直连 Anthropic（自带 API Key）</label>
+        <input id="keyInput" class="modal__input" type="password" placeholder="sk-ant-…（仅保存在本机浏览器）" autocomplete="off" />
+        <input id="modelInput" class="modal__input" type="text" placeholder="模型（可选，默认 claude-opus-4-8）" autocomplete="off" />
+        <p class="modal__note">密钥只存在你自己的浏览器（localStorage），直接发往 Anthropic 官方接口、不经任何第三方；适合 <code>file://</code> 或 GitHub Pages。没有 Key？到 <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> 获取。</p>
+      </div>
+
+      <div class="modal__actions">
+        <button id="keySave" class="btn btn--primary">保存并启用</button>
+        <button id="keyClear" class="btn btn--ghost">清除 Key</button>
+      </div>
+      <p id="keyStatus" class="modal__status"></p>
+    </div>
+  </div>
+
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   <script src="js/puzzles.js"></script>
