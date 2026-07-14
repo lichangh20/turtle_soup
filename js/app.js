@@ -2,8 +2,8 @@
    海龟汤 · 交互逻辑（原生 JS，无依赖）
    两个视图：题库(list) + 解谜(play)。解谜内向「AI 主持人」提问，由 Claude 大模型裁判。
    启用 AI 的两种方式（二选一）：
-   - 运行 server.py 且设置了环境变量 ANTHROPIC_API_KEY（密钥留在服务器端，最安全）；
-   - 或在页面右上角 🔑 填入 Anthropic API Key（浏览器直连，密钥仅存本机；可用于 file:// 与 GitHub Pages）。
+   - 运行 server.py（自动检测 Gemini / Claude Code / Gemini CLI / Codex / Anthropic，密钥留在服务器端，最安全）；
+   - 或在页面右上角 🔑 填入 Anthropic 或 Gemini API Key（浏览器直连，密钥仅存本机；可用于 file:// 与 GitHub Pages）。
    ========================================================================= */
 (function () {
   "use strict";
@@ -32,6 +32,7 @@
 
   /* ---------- AI 主持人（Claude）提示词与结构化输出 ---------- */
   const AI_MODEL_DEFAULT = "claude-opus-4-8";
+  const GEMINI_MODEL_DEFAULT = "gemini-2.5-flash";
   const ASK_SYSTEM = `你是「海龟汤」情境推理游戏的主持人。你已知这道题的【汤面】（玩家能看到的谜面）和【汤底】（真相，玩家看不到）。
 玩家会向你提出只能用「是/否」回答的问题，你要严格依据【汤底】判断，并从下列选项中给出唯一判定：
 - "是"：按汤底，问题描述的情况成立。
@@ -64,18 +65,21 @@
    "hintsWrap","hintsList","answerBlock","answerText","answerCover","qaMode","chat","askForm",
    "askInput","askBtn","btnHint","btnAnswer","btnNext","toast","btnGen","qaCount",
    "keyModal","keyInput","modelInput","keySave","keyClear","keyClose","keyStatus",
-   "providerRow","providerSelect"].forEach((k) => (el[k] = $(k)));
+   "providerRow","providerSelect","browserProvider","browserNote"].forEach((k) => (el[k] = $(k)));
 
   /* ---------- 状态 ---------- */
   const K_FAV = "ts_favorites", K_THEME = "ts_theme", K_SEEN = "ts_seen", K_SOLVED = "ts_solved";
-  const K_APIKEY = "ts_api_key", K_MODEL = "ts_api_model", K_PROVIDER = "ts_provider";
+  const K_APIKEY = "ts_api_key", K_MODEL = "ts_api_model", K_PROVIDER = "ts_provider", K_BROWSER = "ts_browser_provider";
   let deck = [], byId = new Map();
   let favorites = new Set(), seen = new Set(), solved = new Set();
   let currentCat = "all", search = "";
   let current = null, hintIndex = 0, answerShown = false, asking = false;
   let serverAI = false, browserKey = "", aiModel = "", aiSeq = 1;
   let serverLabel = "", serverModel = "", chosenProvider = "", serverProviders = [];
+  let browserProvider = "anthropic";   // 浏览器直连后端：anthropic | gemini
   const aiReady = () => serverAI || !!browserKey;
+  const defaultModelFor = (prov) => (prov === "gemini" ? GEMINI_MODEL_DEFAULT : AI_MODEL_DEFAULT);
+  const browserLabel = () => (browserProvider === "gemini" ? "Gemini" : "Claude");
   const chats = {};      // id -> [ {who:'host'|'me', ...} ]
   const aiHints = {};    // id -> [hint strings already given]
 
@@ -297,12 +301,12 @@
     const on = aiReady();
     let desc;
     if (serverAI) desc = "服务器 · " + activeProviderLabel();
-    else if (browserKey) desc = "浏览器·Claude · " + (aiModel || AI_MODEL_DEFAULT);
+    else if (browserKey) desc = "浏览器·" + browserLabel() + " · " + (aiModel || defaultModelFor(browserProvider));
     else desc = "";
     el.qaMode.textContent = on ? ("🤖 AI 主持（" + desc + "）") : "⚠️ 未启用 AI · 点 🔑 设置 API Key";
     el.aiBadge.className = "ai-badge " + (on ? "is-ai" : "is-off");
     el.aiBadge.textContent = on ? "🤖 AI 主持" : "🔑 设置 Key";
-    el.aiBadge.title = on ? "AI 主持人已就位（点击可修改 Key）" : "点击设置 Anthropic API Key 以启用 AI 主持人";
+    el.aiBadge.title = on ? "AI 主持人已就位（点击可修改 Key）" : "点击设置 API Key（Anthropic 或 Gemini）以启用 AI 主持人";
     if (el.btnGen) el.btnGen.hidden = !on;
   }
   function updateQaCount() {
@@ -350,7 +354,7 @@
   async function ask(question) {
     const p = current; if (!p || asking) return;
     const q = question.trim(); if (!q) return;
-    if (!aiReady()) { toast("请先点右上角 🔑 设置 Anthropic API Key（或用配置了密钥的服务器打开）"); openKeyPanel(); return; }
+    if (!aiReady()) { toast("请先点右上角 🔑 设置 API Key（Anthropic 或 Gemini，或用配置了密钥的服务器打开）"); openKeyPanel(); return; }
     asking = true; el.askBtn.disabled = true; el.askInput.disabled = true;
     chats[p.id].push({ who: "me", text: q });
     chats[p.id].push({ who: "host", thinking: true });
@@ -377,7 +381,7 @@
     }
   }
 
-  /* ---------- AI 客户端（服务器优先，其次浏览器直连 Anthropic）----------
+  /* ---------- AI 客户端（服务器优先，其次浏览器直连 Anthropic / Gemini）----------
      无 AI 时不再有“本地裁判”兜底：海龟汤的裁判必须由大模型完成。 */
   async function anthropicDirect(system, user, schema, maxTokens) {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -403,6 +407,55 @@
     let text = ""; for (const b of (data.content || [])) { if (b.type === "text") { text = b.text; break; } }
     return JSON.parse(text);
   }
+  /* 把标准 JSON-Schema 转成 Gemini 的 responseSchema（类型大写、去掉 additionalProperties），与 server.py 一致。 */
+  function geminiSchema(s) {
+    if (Array.isArray(s)) return s.map(geminiSchema);
+    if (!s || typeof s !== "object") return s;
+    const out = {};
+    for (const k in s) {
+      if (k === "additionalProperties") continue;
+      if (k === "type") out.type = String(s.type).toUpperCase();
+      else if (k === "properties") { out.properties = {}; for (const p in s.properties) out.properties[p] = geminiSchema(s.properties[p]); }
+      else if (k === "items") out.items = geminiSchema(s.items);
+      else out[k] = s[k];
+    }
+    return out;
+  }
+  /* 浏览器直连 Gemini：与 server.py 的 gen_gemini 等价（key 走 ?key= 查询参数，浏览器直接 TLS 直连 Google，不经第三方）。 */
+  async function geminiDirect(system, user, schema, maxTokens) {
+    const model = aiModel || GEMINI_MODEL_DEFAULT;
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/" +
+      encodeURIComponent(model) + ":generateContent?key=" + encodeURIComponent(browserKey);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: system }] },
+        contents: [{ role: "user", parts: [{ text: user }] }],
+        generationConfig: { responseMimeType: "application/json", responseSchema: geminiSchema(schema), maxOutputTokens: Math.max(maxTokens, 768) },
+      }),
+    });
+    if (!res.ok) {
+      let t = ""; try { t = await res.text(); } catch (e) {}
+      const bad = res.status === 400 || res.status === 403;
+      throw new Error("HTTP " + res.status + (bad ? "（API Key 无效或无权限）" : "") + " " + t.slice(0, 160));
+    }
+    const data = await res.json();
+    const cand = (data.candidates || [])[0];
+    if (!cand) {
+      const br = data.promptFeedback && data.promptFeedback.blockReason;
+      throw new Error(br ? ("请求被拦截：" + br) : "Gemini 无返回内容");
+    }
+    let text = ""; for (const part of ((cand.content && cand.content.parts) || [])) { if (part.text) text += part.text; }
+    if (!text) throw new Error(cand.finishReason === "MAX_TOKENS" ? "输出超长被截断，请重试" : "Gemini 返回为空");
+    return JSON.parse(text);
+  }
+  /* 按所选浏览器后端分发 */
+  function browserDirect(system, user, schema, maxTokens) {
+    return browserProvider === "gemini"
+      ? geminiDirect(system, user, schema, maxTokens)
+      : anthropicDirect(system, user, schema, maxTokens);
+  }
   function buildAskUser(surface, answer, question, history) {
     let u = "【汤面】\n" + surface.trim() + "\n\n【汤底（仅你可见，严禁泄露给玩家）】\n" + answer.trim();
     if (history && history.length) {
@@ -422,7 +475,7 @@
         if (!browserKey) throw new Error(serverReason(d.reason));
       } catch (e) { if (!browserKey) throw e; }
     }
-    const r = await anthropicDirect(ASK_SYSTEM, buildAskUser(surface, answer, question, history), ASK_SCHEMA, 500);
+    const r = await browserDirect(ASK_SYSTEM, buildAskUser(surface, answer, question, history), ASK_SCHEMA, 500);
     return { verdict: r.verdict, note: r.note, solved: !!r.solved };
   }
   async function judgeHint(surface, answer, asked) {
@@ -437,7 +490,7 @@
     }
     let u = "【汤面】\n" + surface + "\n\n【汤底（仅你可见）】\n" + answer;
     if (asked && asked.length) u += "\n\n【已给过的提示，请勿重复】\n" + asked.map((a) => "- " + a).join("\n");
-    return (await anthropicDirect(HINT_SYSTEM, u, HINT_SCHEMA, 300)).hint;
+    return (await browserDirect(HINT_SYSTEM, u, HINT_SCHEMA, 300)).hint;
   }
   async function judgeGenerate(flavor) {
     if (serverAI) {
@@ -449,7 +502,7 @@
       } catch (e) { if (!browserKey) throw e; }
     }
     let u = "请原创一道全新的海龟汤。"; if (flavor) u += "口味偏向：" + flavor + "。";
-    return await anthropicDirect(GEN_SYSTEM, u, GEN_SCHEMA, 1200);
+    return await browserDirect(GEN_SYSTEM, u, GEN_SCHEMA, 1200);
   }
   function aiErrText(e) {
     const m = (e && e.message) || String(e);
@@ -571,11 +624,21 @@
   function refreshKeyStatus() {
     if (!el.keyStatus) return;
     if (serverAI) el.keyStatus.textContent = "当前：本地服务器 · " + activeProviderLabel();
-    else if (browserKey) el.keyStatus.textContent = "当前：浏览器直连 Claude（" + (aiModel || AI_MODEL_DEFAULT) + "）";
+    else if (browserKey) el.keyStatus.textContent = "当前：浏览器直连 " + browserLabel() + "（" + (aiModel || defaultModelFor(browserProvider)) + "）";
     else el.keyStatus.textContent = "当前：未启用 AI —— 提问 / AI 出题都需要它。";
+  }
+  function updateBrowserHints() {
+    const gem = browserProvider === "gemini";
+    if (el.keyInput) el.keyInput.placeholder = (gem ? "AIza…" : "sk-ant-…") + "（仅保存在本机浏览器）";
+    if (el.modelInput) el.modelInput.placeholder = "模型（可选，默认 " + defaultModelFor(browserProvider) + "）";
+    if (el.browserNote) el.browserNote.innerHTML = gem
+      ? "密钥只存在你自己的浏览器（localStorage），由浏览器 TLS 直连 Google 官方接口、不经任何第三方；适合 <code>file://</code> 或 GitHub Pages。没有 Key？到 <a href=\"https://aistudio.google.com/apikey\" target=\"_blank\" rel=\"noopener\">aistudio.google.com/apikey</a> 免费获取。"
+      : "密钥只存在你自己的浏览器（localStorage），直接发往 Anthropic 官方接口、不经任何第三方；适合 <code>file://</code> 或 GitHub Pages。没有 Key？到 <a href=\"https://console.anthropic.com/settings/keys\" target=\"_blank\" rel=\"noopener\">console.anthropic.com</a> 获取。";
   }
   function openKeyPanel() {
     populateProviders();
+    if (el.browserProvider) el.browserProvider.value = browserProvider;
+    updateBrowserHints();
     if (el.keyInput) el.keyInput.value = browserKey || "";
     if (el.modelInput) el.modelInput.value = aiModel || "";
     refreshKeyStatus();
@@ -586,11 +649,16 @@
     const k = (el.keyInput.value || "").trim();
     const m = (el.modelInput.value || "").trim();
     if (el.providerSelect) chosenProvider = el.providerSelect.value;
+    // 浏览器直连后端：优先用下拉选择；若 key 前缀明确（AIza→Gemini / sk-ant→Anthropic）则以 key 为准，避免选错。
+    let bp = el.browserProvider ? el.browserProvider.value : browserProvider;
+    if (/^AIza/.test(k)) bp = "gemini"; else if (/^sk-ant/.test(k)) bp = "anthropic";
+    browserProvider = bp === "gemini" ? "gemini" : "anthropic";
     browserKey = k; aiModel = m;
     try {
       if (k) localStorage.setItem(K_APIKEY, k); else localStorage.removeItem(K_APIKEY);
       if (m) localStorage.setItem(K_MODEL, m); else localStorage.removeItem(K_MODEL);
       if (chosenProvider) localStorage.setItem(K_PROVIDER, chosenProvider); else localStorage.removeItem(K_PROVIDER);
+      localStorage.setItem(K_BROWSER, browserProvider);
     } catch (e) {}
     updateQaMode(); closeKeyPanel();
     toast(aiReady() ? "✅ 已更新 AI 主持人设置" : "已保存（当前仍未启用 AI）");
@@ -621,7 +689,7 @@
     byId = new Map(deck.map((p) => [p.id, p]));
     favorites = new Set([...loadSet(K_FAV)].filter((id) => byId.has(id)));
     seen = loadSet(K_SEEN); solved = loadSet(K_SOLVED);
-    try { browserKey = localStorage.getItem(K_APIKEY) || ""; aiModel = localStorage.getItem(K_MODEL) || ""; chosenProvider = localStorage.getItem(K_PROVIDER) || ""; } catch (e) {}
+    try { browserKey = localStorage.getItem(K_APIKEY) || ""; aiModel = localStorage.getItem(K_MODEL) || ""; chosenProvider = localStorage.getItem(K_PROVIDER) || ""; browserProvider = localStorage.getItem(K_BROWSER) === "gemini" ? "gemini" : "anthropic"; } catch (e) {}
 
     buildChips();
     el.sourceNote.innerHTML = "题库来源：网络公开题库 + 世界经典情境谜题 · 离线自带 <b>" + deck.length + "</b> 题，点「🌐 从网上获取更多」可解锁更多在线题目。";
@@ -648,6 +716,11 @@
       chosenProvider = el.providerSelect.value;
       try { if (chosenProvider) localStorage.setItem(K_PROVIDER, chosenProvider); else localStorage.removeItem(K_PROVIDER); } catch (e) {}
       updateQaMode(); refreshKeyStatus();
+    });
+    if (el.browserProvider) el.browserProvider.addEventListener("change", () => {
+      browserProvider = el.browserProvider.value === "gemini" ? "gemini" : "anthropic";
+      try { localStorage.setItem(K_BROWSER, browserProvider); } catch (e) {}
+      updateBrowserHints(); updateQaMode(); refreshKeyStatus();
     });
 
     el.btnFav.addEventListener("click", () => current && toggleFav(current.id));

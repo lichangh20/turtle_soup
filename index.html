@@ -134,10 +134,14 @@
       </div>
 
       <div class="modal__row">
-        <label>② 或：浏览器直连 Anthropic（自带 API Key）</label>
+        <label>② 或：浏览器直连（自带 API Key，适合 file:// 与 GitHub Pages）</label>
+        <select id="browserProvider" class="modal__select">
+          <option value="anthropic">Anthropic · Claude（默认 claude-opus-4-8）</option>
+          <option value="gemini">Google · Gemini（默认 gemini-2.5-flash，有免费额度）</option>
+        </select>
         <input id="keyInput" class="modal__input" type="password" placeholder="sk-ant-…（仅保存在本机浏览器）" autocomplete="off" />
         <input id="modelInput" class="modal__input" type="text" placeholder="模型（可选，默认 claude-opus-4-8）" autocomplete="off" />
-        <p class="modal__note">密钥只存在你自己的浏览器（localStorage），直接发往 Anthropic 官方接口、不经任何第三方；适合 <code>file://</code> 或 GitHub Pages。没有 Key？到 <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> 获取。</p>
+        <p id="browserNote" class="modal__note">密钥只存在你自己的浏览器（localStorage），直接发往 Anthropic 官方接口、不经任何第三方；适合 <code>file://</code> 或 GitHub Pages。没有 Key？到 <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> 获取。</p>
       </div>
 
       <div class="modal__actions">
